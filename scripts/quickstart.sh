@@ -176,10 +176,20 @@ fi
 
 # ── 10. Start frontend ──────────────────────────────────────────────
 info "Starting frontend dev server on port 5173..."
-(cd frontend && npm run dev) &>/dev/null &
+FRONTEND_LOG="$(mktemp -t openjarvis-frontend)"
+(cd frontend && npm run dev) &>"$FRONTEND_LOG" &
 CLEANUP_PIDS+=($!)
-sleep 3
-ok "Frontend running at http://localhost:5173"
+for _ in $(seq 20); do
+  curl -sf http://localhost:5173 &>/dev/null && break
+  sleep 1
+done
+if curl -sf http://localhost:5173 &>/dev/null; then
+  ok "Frontend running at http://localhost:5173"
+else
+  warn "Frontend failed to start. Log: $FRONTEND_LOG"
+  tail -20 "$FRONTEND_LOG"
+  exit 1
+fi
 
 # ── 11. Open browser ────────────────────────────────────────────────
 URL="http://localhost:5173"
