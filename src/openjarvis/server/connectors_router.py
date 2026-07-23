@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 # ``Request`` must be importable at *module* scope so that FastAPI can resolve
@@ -25,6 +27,34 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache of connector instances (keyed by connector_id).
 _instances: Dict[str, Any] = {}
+
+# Connectors the user explicitly disconnected.
+#
+# Local connectors report *availability*, not user intent: AppleNotes and
+# iMessage return ``db_path.exists()`` and HackerNews returns a literal True,
+# so their ``disconnect()`` (which only flips an unread ``_connected`` flag)
+# left them showing as connected forever. Record the opt-out here instead —
+# one place every read routes through, and it survives a backend restart.
+_OPT_OUT_PATH = Path.home() / ".openjarvis" / "connectors" / "disconnected.json"
+
+
+def _opt_outs() -> set:
+    """Return the set of connector_ids the user has disconnected."""
+    try:
+        return set(json.loads(_OPT_OUT_PATH.read_text()))
+    except Exception:
+        return set()
+
+
+def _set_opt_out(connector_id: str, disconnected: bool) -> None:
+    """Add or remove ``connector_id`` from the persisted opt-out set."""
+    ids = _opt_outs()
+    ids.discard(connector_id) if not disconnected else ids.add(connector_id)
+    try:
+        _OPT_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _OPT_OUT_PATH.write_text(json.dumps(sorted(ids)))
+    except OSError:
+        logger.warning("Could not persist connector opt-out", exc_info=True)
 
 
 def _ensure_connectors_registered() -> None:
@@ -118,6 +148,12 @@ def create_connectors_router():
             _instances[connector_id] = cls()
         return _instances[connector_id]
 
+    def _is_connected(connector_id: str, instance: Any) -> bool:
+        """Connection status, honouring an explicit user disconnect."""
+        if connector_id in _opt_outs():
+            return False
+        return bool(instance.is_connected())
+
     def _connector_summary(connector_id: str, instance: Any) -> Dict[str, Any]:
         """Build the dict returned by GET /connectors."""
         chunks = 0
@@ -137,7 +173,7 @@ def create_connectors_router():
             "connector_id": connector_id,
             "display_name": getattr(instance, "display_name", connector_id),
             "auth_type": getattr(instance, "auth_type", "unknown"),
-            "connected": instance.is_connected(),
+            "connected": _is_connected(connector_id, instance),
             "chunks": chunks,
         }
 
@@ -367,7 +403,7 @@ def create_connectors_router():
             "connector_id": connector_id,
             "display_name": getattr(instance, "display_name", connector_id),
             "auth_type": getattr(instance, "auth_type", "unknown"),
-            "connected": instance.is_connected(),
+            "connected": _is_connected(connector_id, instance),
             "auth_url": auth_url,
             "mcp_tools": mcp_tools,
             "oauth_setup": oauth_setup,
@@ -440,18 +476,23 @@ def create_connectors_router():
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+        # Connecting clears any earlier opt-out, otherwise a connector the
+        # user once disconnected could never be re-enabled from the UI.
+        _set_opt_out(connector_id, False)
+
         # Auto-trigger a full backfill on a successful connect. Routed
         # through the same _start_sync helper that POST /sync uses so the
         # connection's progress is visible to GET /{id}/sync polling
         # immediately — the user shouldn't have to click "Sync Now".
         sync_status: Optional[str] = None
-        if instance.is_connected():
+        connected = _is_connected(connector_id, instance)
+        if connected:
             sync_status = _start_sync(connector_id, instance)
 
         return {
             "connector_id": connector_id,
-            "connected": instance.is_connected(),
-            "status": "connected" if instance.is_connected() else "pending",
+            "connected": connected,
+            "status": "connected" if connected else "pending",
             "sync_status": sync_status,
         }
 
@@ -469,6 +510,10 @@ def create_connectors_router():
             instance.disconnect()
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        # Record the opt-out. Connectors whose is_connected() reports mere
+        # availability (local file present, always-on feeds) ignore their own
+        # disconnect(), so this is what actually makes the button stick.
+        _set_opt_out(connector_id, True)
         return {
             "connector_id": connector_id,
             "connected": False,
@@ -622,7 +667,7 @@ def create_connectors_router():
                 detail=f"Connector '{connector_id}' not found",
             )
         inst = _get_or_create(connector_id)
-        if not inst.is_connected():
+        if not _is_connected(connector_id, inst):
             raise HTTPException(
                 status_code=400,
                 detail=f"Connector '{connector_id}' is not connected",
